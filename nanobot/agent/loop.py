@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -91,7 +92,9 @@ class AgentLoop:
         ))
         
         # Web tools
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
+        brave_key = self.brave_api_key or os.environ.get("BRAVE_API_KEY", "")
+        if brave_key:
+            self.tools.register(WebSearchTool(api_key=brave_key))
         self.tools.register(WebFetchTool())
         
         # Message tool
