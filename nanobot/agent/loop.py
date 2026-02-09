@@ -22,6 +22,73 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 
+MAX_MESSAGES = 10
+
+def _format_messages_for_log(messages: list[dict], max_content: int = 200) -> str:
+    """Format a messages array into a compact readable summary for logging.
+
+    Each message is shown as one line with role, content preview, and tool info.
+    """
+    lines = [f"Messages ({len(messages)}):"]
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = msg.get("content") or ""
+
+        # For multimodal content (list of dicts), just note it
+        if isinstance(content, list):
+            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            images = sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+            content = (text_parts[0] if text_parts else "") + (f" [+{images} image(s)]" if images else "")
+
+        preview = content[:max_content].replace("\n", "\\n")
+        if len(content) > max_content:
+            preview += f"... ({len(content)} chars)"
+
+        # Tool-call info for assistant messages
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+            line = f"  [{i}] {role}: {preview} | tool_calls: {', '.join(names)}"
+        elif role == "tool":
+            tool_name = msg.get("name", "?")
+            line = f"  [{i}] {role}({tool_name}): {preview}"
+        else:
+            line = f"  [{i}] {role}: {preview}"
+
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _format_response_for_log(response: "LLMResponse", max_content: int = 500) -> str:
+    """Format an LLM response into a compact readable summary for logging."""
+    parts = [f"LLM response (finish={response.finish_reason}):"]
+
+    # Content
+    content = response.content or ""
+    if content:
+        preview = content[:max_content].replace("\n", "\\n")
+        if len(content) > max_content:
+            preview += f"... ({len(content)} chars)"
+        parts.append(f"  content: {preview}")
+    else:
+        parts.append("  content: (none)")
+
+    # Tool calls
+    if response.tool_calls:
+        parts.append(f"  tool_calls ({len(response.tool_calls)}):")
+        for tc in response.tool_calls:
+            args_str = json.dumps(tc.arguments, ensure_ascii=False)
+            args_preview = args_str[:300]
+            if len(args_str) > 300:
+                args_preview += "..."
+            parts.append(f"    - {tc.name}({args_preview})")
+
+    # Usage
+    if response.usage:
+        parts.append(f"  usage: {response.usage}")
+
+    return "\n".join(parts)
+
 
 class AgentLoop:
     """
@@ -158,8 +225,7 @@ class AgentLoop:
         if msg.channel == "system":
             return await self._process_system_message(msg)
         
-        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
+        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {msg.content}")
         
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
@@ -179,7 +245,7 @@ class AgentLoop:
         
         # Build initial messages (use get_history for LLM-formatted messages)
         messages = self.context.build_messages(
-            history=session.get_history(),
+            history=session.get_history(max_messages=MAX_MESSAGES),
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
@@ -192,6 +258,8 @@ class AgentLoop:
         
         while iteration < self.max_iterations:
             iteration += 1
+            logger.debug(f"[iter {iteration}/{self.max_iterations}] Calling LLM ({self.model})...")
+            logger.debug(f"[iter {iteration}] {_format_messages_for_log(messages)}")
             
             # Call LLM
             response = await self.provider.chat(
@@ -200,8 +268,18 @@ class AgentLoop:
                 model=self.model
             )
             
+            # Log full LLM output
+            logger.debug(f"[iter {iteration}] {_format_response_for_log(response)}")
+            
             # Handle tool calls
             if response.has_tool_calls:
+                
+                tool_names = [tc.name for tc in response.tool_calls]
+                logger.info(
+                    f"[iter {iteration}] LLM decided to call {len(response.tool_calls)} tool(s): "
+                    f"{', '.join(tool_names)}"
+                )
+                
                 # Add assistant message with tool calls
                 tool_call_dicts = [
                     {
@@ -221,22 +299,26 @@ class AgentLoop:
                 # Execute tools
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    logger.info(f"[iter {iteration}] Tool call: {tool_call.name}({args_str})")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result_preview = result[:300] + "..." if len(result) > 300 else result
+                    logger.debug(f"[iter {iteration}] Tool result ({tool_call.name}): {result_preview}")
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
-                # No tool calls, we're done
+                # No tool calls — LLM produced final response
                 final_content = response.content
+                logger.debug(f"[iter {iteration}] LLM produced final response (no tool calls), ending loop")
                 break
         
-        if final_content is None:
+        if iteration >= self.max_iterations and final_content is None:
+            logger.warning(
+                f"Agent loop hit max iterations ({self.max_iterations}) without producing a final response"
+            )
             final_content = "I've completed processing but have no response to give."
         
-        # Log response preview
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
+        logger.info(f"Response to {msg.channel}:{msg.sender_id}: {final_content}")
         
         # Save to session
         session.add_message("user", msg.content)
@@ -299,6 +381,8 @@ class AgentLoop:
         
         while iteration < self.max_iterations:
             iteration += 1
+            logger.debug(f"[system][iter {iteration}/{self.max_iterations}] Calling LLM ({self.model})...")
+            logger.debug(f"[system][iter {iteration}] {_format_messages_for_log(messages)}")
             
             response = await self.provider.chat(
                 messages=messages,
@@ -306,7 +390,17 @@ class AgentLoop:
                 model=self.model
             )
             
+            # Log full LLM output
+            logger.debug(f"[system][iter {iteration}] {_format_response_for_log(response)}")
+            
             if response.has_tool_calls:
+                
+                tool_names = [tc.name for tc in response.tool_calls]
+                logger.info(
+                    f"[system][iter {iteration}] LLM decided to call {len(response.tool_calls)} tool(s): "
+                    f"{', '.join(tool_names)}"
+                )
+                
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -324,16 +418,22 @@ class AgentLoop:
                 
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    logger.info(f"[system][iter {iteration}] Tool call: {tool_call.name}({args_str})")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result_preview = result[:300] + "..." if len(result) > 300 else result
+                    logger.debug(f"[system][iter {iteration}] Tool result ({tool_call.name}): {result_preview}")
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
                 final_content = response.content
+                logger.debug(f"[system][iter {iteration}] LLM produced final response (no tool calls), ending loop")
                 break
         
-        if final_content is None:
+        if iteration >= self.max_iterations and final_content is None:
+            logger.warning(
+                f"System agent loop hit max iterations ({self.max_iterations}) without producing a final response"
+            )
             final_content = "Background task completed."
         
         # Save to session (mark as system message in history)
