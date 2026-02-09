@@ -11,6 +11,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
+from nanobot.session.manager import SessionManager
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -85,10 +86,17 @@ class TelegramChannel(BaseChannel):
     
     name = "telegram"
     
-    def __init__(self, config: TelegramConfig, bus: MessageBus, groq_api_key: str = ""):
+    def __init__(
+        self,
+        config: TelegramConfig,
+        bus: MessageBus,
+        groq_api_key: str = "",
+        session_manager: SessionManager | None = None,
+    ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
+        self.session_manager = session_manager
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
     
@@ -115,9 +123,10 @@ class TelegramChannel(BaseChannel):
             )
         )
         
-        # Add /start command handler
+        # Add command handlers
         from telegram.ext import CommandHandler
         self._app.add_handler(CommandHandler("start", self._on_start))
+        self._app.add_handler(CommandHandler("new", self._on_new_session))
         
         logger.info("Starting Telegram bot (polling mode)...")
         
@@ -190,6 +199,26 @@ class TelegramChannel(BaseChannel):
             "Send me a message and I'll respond!"
         )
     
+    async def _on_new_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /new command — archive current session and start fresh."""
+        if not update.message or not update.effective_user:
+            return
+        
+        if not self.session_manager:
+            await update.message.reply_text("Session management is not available.")
+            return
+        
+        chat_id = update.message.chat_id
+        session_key = f"telegram:{chat_id}"
+        archived = self.session_manager.archive(session_key)
+        
+        if archived:
+            await update.message.reply_text("Session archived. Starting fresh!")
+        else:
+            await update.message.reply_text(
+                "No previous session found. You're already starting fresh!"
+            )
+    
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
         if not update.message or not update.effective_user:
@@ -256,7 +285,7 @@ class TelegramChannel(BaseChannel):
                     transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
                     transcription = await transcriber.transcribe(file_path)
                     if transcription:
-                        logger.info(f"Transcribed {media_type}: {transcription[:50]}...")
+                        logger.info(f"Transcribed {media_type}: {transcription}")
                         content_parts.append(f"[transcription: {transcription}]")
                     else:
                         content_parts.append(f"[{media_type}: {file_path}]")
@@ -270,7 +299,7 @@ class TelegramChannel(BaseChannel):
         
         content = "\n".join(content_parts) if content_parts else "[empty message]"
         
-        logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
+        logger.debug(f"Telegram message from {sender_id}: {content}")
         
         # Forward to the message bus
         await self._handle_message(
