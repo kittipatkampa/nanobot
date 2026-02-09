@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -107,7 +108,9 @@ class SubagentManager:
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
             ))
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
+            brave_key = self.brave_api_key or os.environ.get("BRAVE_API_KEY", "")
+            if brave_key:
+                tools.register(WebSearchTool(api_key=brave_key))
             tools.register(WebFetchTool())
             
             # Build messages with subagent-specific prompt

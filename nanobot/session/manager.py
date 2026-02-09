@@ -153,6 +153,30 @@ class SessionManager:
         
         self._cache[session.key] = session
     
+    def archive(self, key: str) -> bool:
+        """
+        Archive a session by renaming its file with a timestamp suffix.
+        
+        The original file is moved to a backup (e.g. telegram_123_20260208T153000.jsonl)
+        and the in-memory cache is invalidated so the next get_or_create() starts fresh.
+        
+        Args:
+            key: Session key.
+        
+        Returns:
+            True if archived, False if no session file existed.
+        """
+        path = self._get_session_path(key)
+        if not path.exists():
+            return False
+        
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        backup = path.with_name(f"{path.stem}_{ts}.jsonl")
+        path.rename(backup)
+        self._cache.pop(key, None)
+        logger.info(f"Archived session {key} to {backup.name}")
+        return True
+    
     def delete(self, key: str) -> bool:
         """
         Delete a session.
